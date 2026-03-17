@@ -9,6 +9,7 @@ output/
 logs/
 
 # Python
+**/__pycache__/
 __pycache__/
 *.pyc
 *.pyo
