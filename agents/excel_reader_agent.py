@@ -225,16 +225,44 @@ def _parse_sheet(sheet: str, df, add_fn):
 # ─────────────────────────────────────────────
 # SENT EMAIL TRACKER
 # ─────────────────────────────────────────────
+def load_bounced_log(bounced_path: str = "logs/bounced_emails.json") -> set:
+    """Load bounced (non-existent) email addresses — never retry these."""
+    path = Path(bounced_path)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            return set(data.get("bounced", []))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_bounced_log(bounced_set: set, bounced_path: str = "logs/bounced_emails.json"):
+    """Append newly bounced addresses to the bounced log."""
+    existing = load_bounced_log(bounced_path)
+    merged = existing | bounced_set
+    Path(bounced_path).parent.mkdir(exist_ok=True)
+    data = {
+        "bounced": sorted(merged),
+        "note": "These addresses bounced (mailbox does not exist). Never retry.",
+    }
+    Path(bounced_path).write_text(json.dumps(data, indent=2))
+
+
 def load_sent_log(log_path: str = "logs/sent_emails.json") -> set:
-    """Load previously sent email addresses."""
+    """Load previously sent email addresses (excludes bounced)."""
     path = Path(log_path)
     if path.exists():
         try:
             data = json.loads(path.read_text())
-            return set(data.get("sent", []))
+            sent = set(data.get("sent", []))
         except Exception:
-            return set()
-    return set()
+            sent = set()
+    else:
+        sent = set()
+    # Always exclude bounced addresses from the "sent" pool
+    bounced = load_bounced_log()
+    return sent | bounced
 
 
 def save_sent_log(sent_set: set, log_path: str = "logs/sent_emails.json"):

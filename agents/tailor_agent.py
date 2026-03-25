@@ -184,18 +184,42 @@ Remember:
 # ─────────────────────────────────────────────
 # COLD PITCH (no JD — HR outreach mode)
 # ─────────────────────────────────────────────
-def generate_pitch_email(hr_contact: dict, api_key: str) -> str:
+def generate_pitch_email(hr_contact: dict, api_key: str, skill_area: str = None) -> str:
     """
     Generates a personalized cold pitch email to an HR contact
     when no specific JD is available.
 
+    Uses skill-specific templates for higher relevance when available.
+
     Args:
-        hr_contact: { hr_name, hr_email, company, designation }
+        hr_contact: { hr_name, hr_email, company, designation, skill_area }
         api_key: Claude API key
+        skill_area: Optional skill area ("Agentic AI & LLM", "Computer Vision", etc.)
+                   If provided, uses skill-specific template instead of Claude generation
 
     Returns:
         Cold pitch email as plain text (with Subject: line at top)
     """
+    # Try to use skill-specific templates for better performance
+    if skill_area or hr_contact.get("skill_area"):
+        try:
+            from tools.email_templates import EmailTemplates
+            skill = skill_area or hr_contact.get("skill_area")
+            hr_name = hr_contact.get("hr_name", "")
+            company = hr_contact.get("company", "your organisation")
+
+            template_email = EmailTemplates.get_template(skill, hr_name, company)
+
+            # Add subject line
+            subject_line = f"Subject: Exploring Opportunities in {EmailTemplates.get_skill_area_summary(skill)}"
+            email_text = f"{subject_line}\n\n{template_email}"
+
+            logger.info(f"✅ Pitch email generated (skill-specific) for {company} [{skill}]")
+            return email_text
+        except Exception as e:
+            logger.warning(f"Could not use skill-specific template: {e}. Falling back to Claude generation.")
+
+    # Fallback: Generate with Claude
     knowledge = _load_knowledge()
     master_resume = knowledge.get("master_resume.md", "")
 
@@ -242,5 +266,5 @@ Their Role: {designation if designation else 'HR/Recruiter'}
     )
 
     email_text = response.content[0].text.strip()
-    logger.info(f"✅ Pitch email generated for {company}")
+    logger.info(f"✅ Pitch email generated (Claude) for {company}")
     return email_text

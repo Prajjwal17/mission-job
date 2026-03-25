@@ -17,6 +17,21 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def validate_email_domain(email: str) -> bool:
+    """
+    Checks if the email domain has valid MX records via DNS lookup.
+    Returns True if reachable, False if domain is dead/non-existent.
+    Catches ~80% of invalid addresses before wasting an SMTP attempt.
+    """
+    try:
+        import dns.resolver
+        domain = email.split("@", 1)[1]
+        dns.resolver.resolve(domain, "MX")
+        return True
+    except Exception:
+        return False
+
+
 def _extract_subject(cold_email_text: str) -> tuple[str, str]:
     """
     Extracts subject line from cold email text.
@@ -48,31 +63,32 @@ def send_cold_email(
     app_password: str,
     hr_name: str = "",
     dry_run: bool = False
-) -> bool:
+) -> dict:
     """
     Sends a cold email with the resume PDF attached.
 
-    Args:
-        hr_email: Recipient email address
-        cold_email_text: Full email text (with "Subject: ..." line at top)
-        pdf_path: Path to the generated PDF resume
-        sender_email: Your Gmail address
-        app_password: Gmail App Password (16 chars, no spaces)
-        hr_name: HR contact name (for logging)
-        dry_run: If True, prints email without sending
-
     Returns:
-        True if sent successfully, False otherwise
+        dict with keys:
+          "sent"    (bool) — True if email was accepted by the server
+          "bounced" (bool) — True if the address/domain is definitively invalid
     """
+    result = {"sent": False, "bounced": False}
 
     if not hr_email:
         logger.warning("⚠️  No HR email found. Skipping email send.")
-        return False
+        return result
 
     # Validate email format
     if not re.match(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}", hr_email):
         logger.warning(f"⚠️  Invalid email format: {hr_email}")
-        return False
+        result["bounced"] = True
+        return result
+
+    # DNS MX pre-validation — skip dead domains before attempting SMTP
+    if not dry_run and not validate_email_domain(hr_email):
+        logger.warning(f"⚠️  No MX record for domain of {hr_email} — marking as bounced")
+        result["bounced"] = True
+        return result
 
     subject, body = _extract_subject(cold_email_text)
 
@@ -88,7 +104,8 @@ def send_cold_email(
         print("-"*60)
         print(body)
         print("="*60 + "\n")
-        return True
+        result["sent"] = True
+        return result
 
     # ── BUILD EMAIL ──
     msg = MIMEMultipart()
@@ -123,15 +140,20 @@ def send_cold_email(
 
         recipient_label = f"{hr_name} <{hr_email}>" if hr_name else hr_email
         logger.info(f"✅ Email sent to {recipient_label}")
-        return True
+        result["sent"] = True
+        return result
 
     except smtplib.SMTPAuthenticationError:
         logger.error("❌ Gmail authentication failed. Check your App Password.")
         logger.error("   Go to: Google Account → Security → 2-Step Verification → App Passwords")
-        return False
+        return result
     except smtplib.SMTPRecipientsRefused:
-        logger.error(f"❌ Recipient refused: {hr_email}")
-        return False
+        logger.error(f"❌ Recipient refused (mailbox does not exist): {hr_email}")
+        result["bounced"] = True
+        return result
+    except smtplib.SMTPException as e:
+        logger.error(f"❌ SMTP error for {hr_email}: {e}")
+        return result
     except Exception as e:
         logger.error(f"❌ Failed to send email: {e}")
-        return False
+        return result

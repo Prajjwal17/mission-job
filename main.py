@@ -55,9 +55,13 @@ from agents.mailer_agent import send_cold_email
 from agents.drive_agent import upload_to_drive
 from agents.excel_reader_agent import (
     read_job_links, read_hr_contacts, scrape_jd_from_url,
-    load_sent_log, save_sent_log
+    load_sent_log, save_sent_log, load_bounced_log, save_bounced_log
 )
 from agents.job_board_scraper import scrape_all_boards
+
+# ── Import strategic tools ──
+from tools.strategic_filter import StrategicFilter
+from tools.email_templates import EmailTemplates
 
 
 # ─────────────────────────────────────────────
@@ -138,7 +142,7 @@ def process_job(job: dict, dry_run: bool = False) -> dict:
     hr_email = job.get("hr_email", "")
     if hr_email or dry_run:
         try:
-            sent = send_cold_email(
+            send_result = send_cold_email(
                 hr_email=hr_email if hr_email else "test@example.com",
                 cold_email_text=tailored["cold_email"],
                 pdf_path=result["pdf_path"],
@@ -147,7 +151,7 @@ def process_job(job: dict, dry_run: bool = False) -> dict:
                 hr_name=job.get("hr_name", ""),
                 dry_run=dry_run
             )
-            result["email_sent"] = sent
+            result["email_sent"] = send_result["sent"]
         except Exception as e:
             logger.error(f"❌ Mailer Agent failed: {e}")
     else:
@@ -326,14 +330,22 @@ def run_excel_jobs_mode(dry_run: bool = False):
 
 # ─────────────────────────────────────────────
 # EXCEL HR MODE — cold outreach to HR contacts from Excel
+# STRATEGIC: Filters by skill-matched companies + uses skill-specific templates
 # ─────────────────────────────────────────────
-def run_excel_hr_mode(dry_run: bool = False, daily_limit: int = None):
+def run_excel_hr_mode(dry_run: bool = False, daily_limit: int = None,
+                      strategic_only: bool = True):
     """
-    Reads HR contacts from the Excel file and sends a personalized
-    cold pitch email + base resume PDF to each one.
+    Reads HR contacts from the Excel file and sends personalized cold emails.
 
-    Uses a sent-email log to avoid duplicates across runs.
-    Respects the DAILY_EMAIL_LIMIT in config.
+    ENHANCEMENTS:
+    - Strategic filtering: Only targets skill-matched companies
+    - Skill-specific templates: Email varies by company's skill area
+    - Response tracking: Logs company name + skill area for analysis
+
+    Args:
+        dry_run: Preview without sending
+        daily_limit: Max emails to send today (default: config.DAILY_EMAIL_LIMIT)
+        strategic_only: Filter to strategic companies only (default: True)
     """
     excel_path  = config.EXCEL_FILE_PATH
     limit       = daily_limit or config.DAILY_EMAIL_LIMIT
@@ -342,36 +354,57 @@ def run_excel_hr_mode(dry_run: bool = False, daily_limit: int = None):
     logger.info(f"Reading HR contacts from: {excel_path}")
     contacts = read_hr_contacts(excel_path)
 
-    # Filter out already-contacted
+    # FILTER 1: Remove already-contacted
     fresh = [c for c in contacts if c['hr_email'] not in sent_log]
     logger.info(f"Total contacts: {len(contacts)} | Already sent: {len(sent_log)} | Fresh: {len(fresh)}")
 
-    if not fresh:
-        logger.info("All contacts already emailed. Nothing to do.")
-        return
+    # FILTER 2: Strategic filtering (if enabled)
+    strategic_filter = StrategicFilter("strategic_target_companies_clean.csv")
+    if strategic_only and strategic_filter.enabled:
+        filtered_contacts, filter_stats = strategic_filter.filter_contacts(
+            fresh,
+            strategy="strategic_first"  # Strategic companies first, then others
+        )
+        logger.info(f"[STRATEGIC FILTER] {filter_stats['strategic']} strategic companies matched")
+        for skill, count in filter_stats.get('by_skill', {}).items():
+            logger.info(f"  {skill}: {count} contacts")
+        batch = filtered_contacts[:limit]
+    else:
+        batch = fresh[:limit]
 
-    batch = fresh[:limit]
     logger.info(f"Sending to {len(batch)} contacts today (limit={limit})")
+
+    if not batch:
+        logger.info("No contacts to send to. Nothing to do.")
+        return
 
     # Generate the base resume PDF once (used for all emails)
     from knowledge import _get_base_resume_md
     base_resume_md = _get_base_resume_md()
 
-    results_sent = 0
-    newly_sent   = set()
+    results_sent  = 0
+    newly_sent    = set()
+    newly_bounced = set()
+    response_log  = []  # Track for company-level analysis
 
     for i, contact in enumerate(batch, 1):
-        company  = contact.get('company') or 'your organisation'
-        hr_name  = contact.get('hr_name') or ''
-        hr_email = contact['hr_email']
+        company   = contact.get('company') or 'your organisation'
+        hr_name   = contact.get('hr_name') or ''
+        hr_email  = contact['hr_email']
+        skill_area = contact.get('skill_area')  # From strategic filter
 
-        logger.info(f"[{i}/{len(batch)}] {hr_name or 'HR'} @ {company} <{hr_email}>")
+        status_tag = f"[{skill_area}]" if skill_area else "[Generic]"
+        logger.info(f"[{i}/{len(batch)}] {status_tag} {hr_name or 'HR'} @ {company}")
 
         try:
-            # Generate personalised pitch email
-            pitch_email = generate_pitch_email(contact, api_key=config.CLAUDE_API_KEY)
+            # STEP 1: Generate skill-specific pitch email
+            pitch_email = generate_pitch_email(
+                contact,
+                api_key=config.CLAUDE_API_KEY,
+                skill_area=skill_area
+            )
 
-            # Generate PDF (base resume, no tailoring for cold outreach)
+            # STEP 2: Generate PDF (base resume, no tailoring for cold outreach)
             pdf_path = markdown_to_pdf(
                 resume_markdown=base_resume_md,
                 job_title="General Application",
@@ -379,8 +412,8 @@ def run_excel_hr_mode(dry_run: bool = False, daily_limit: int = None):
                 output_dir=config.OUTPUT_DIR
             )
 
-            # Send (or dry-run preview)
-            sent = send_cold_email(
+            # STEP 3: Send (or dry-run preview)
+            result = send_cold_email(
                 hr_email=hr_email,
                 cold_email_text=pitch_email,
                 pdf_path=pdf_path,
@@ -390,26 +423,74 @@ def run_excel_hr_mode(dry_run: bool = False, daily_limit: int = None):
                 dry_run=dry_run
             )
 
-            if sent:
+            # Track result for company-level analysis
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "hr_email": hr_email,
+                "company": company,
+                "skill_area": skill_area or "Unknown",
+                "status": "sent" if result["sent"] else ("bounced" if result["bounced"] else "failed"),
+                "hr_name": hr_name
+            }
+            response_log.append(log_entry)
+
+            if result["sent"]:
                 newly_sent.add(hr_email)
                 results_sent += 1
+                logger.info(f"  ✓ Sent")
+            elif result["bounced"]:
+                newly_bounced.add(hr_email)
+                logger.warning(f"  ✗ Bounced (will never retry)")
 
         except Exception as e:
-            logger.error(f"  Failed for {hr_email}: {e}")
+            logger.error(f"  ✗ Failed: {e}")
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "hr_email": hr_email,
+                "company": company,
+                "skill_area": skill_area or "Unknown",
+                "status": "error",
+                "error": str(e),
+                "hr_name": hr_name
+            }
+            response_log.append(log_entry)
             continue
 
-        time.sleep(2)   # avoid Gmail rate limits
+        delay = getattr(config, "EMAIL_DELAY_SECONDS", 3)
+        time.sleep(delay)
 
-    # Save updated sent log
+    # Persist logs
     if not dry_run:
         save_sent_log(sent_log | newly_sent, config.SENT_LOG_PATH)
+        if newly_bounced:
+            save_bounced_log(newly_bounced, config.BOUNCED_LOG_PATH)
+            logger.info(f"  Logged {len(newly_bounced)} bounced address(es)")
+
+        # Export response tracking
+        if response_log:
+            response_log_path = Path(config.OUTPUT_DIR) / "response_log.json"
+            existing = []
+            if response_log_path.exists():
+                try:
+                    with open(response_log_path) as f:
+                        existing = json.load(f)
+                except:
+                    pass
+            with open(response_log_path, 'w') as f:
+                json.dump(existing + response_log, f, indent=2, ensure_ascii=False)
+            logger.info(f"  Logged company-level responses to {response_log_path}")
+
+        # Export strategic statistics
+        if strategic_filter.enabled:
+            strategic_filter.export_statistics(batch)
 
     print("\n" + "="*60)
-    print(f"EXCEL HR MODE COMPLETE")
+    print(f"EXCEL HR MODE COMPLETE (STRATEGIC)")
     print(f"  Emails sent today : {results_sent}")
     print(f"  Total ever sent   : {len(sent_log) + len(newly_sent)}")
     print(f"  Remaining contacts: {len(fresh) - results_sent}")
-    print(f"  Run again tomorrow to send the next batch of {limit}")
+    print(f"  Strategic matched : {sum(1 for c in batch if c.get('skill_area'))}")
+    print(f"  At {results_sent * 4}/day (4x runs) → done in ~{max(1, (len(fresh) - results_sent) // (results_sent * 4 or 1))} days")
     print("="*60)
 
 
@@ -524,6 +605,9 @@ Examples:
     parser.add_argument("--excel-hr",   action="store_true", help="Excel HR mode: cold outreach to HR contacts from Excel")
     parser.add_argument("--dry-run",    action="store_true", help="Preview email/PDF without actually sending")
     parser.add_argument("--limit",      type=int, default=None, help="Max jobs/emails to process (overrides config)")
+    parser.add_argument("--strategic-only", action="store_true", default=True,
+                       help="Filter to strategic companies only (default: True)")
+    parser.add_argument("--all-contacts", action="store_true", help="Disable strategic filtering, contact all")
 
     args = parser.parse_args()
 
@@ -538,7 +622,8 @@ Examples:
     elif getattr(args, 'excel_jobs', False):
         run_excel_jobs_mode(dry_run=args.dry_run)
     elif getattr(args, 'excel_hr', False):
-        run_excel_hr_mode(dry_run=args.dry_run, daily_limit=args.limit)
+        strategic = not args.all_contacts  # Use strategic unless --all-contacts flag
+        run_excel_hr_mode(dry_run=args.dry_run, daily_limit=args.limit, strategic_only=strategic)
     else:
         parser.print_help()
         print("\nRECOMMENDED STARTING POINTS:")
