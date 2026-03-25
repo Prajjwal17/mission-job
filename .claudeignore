@@ -1,0 +1,36 @@
+# Exclude large/redundant directories
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+node_modules/
+.git/
+.gitignore
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Large files and logs
+*.log
+logs/**
+output/**
+*.json
+*.csv
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# OS
+Thumbs.db
+.env
+credentials/
