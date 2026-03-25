@@ -63,6 +63,9 @@ from agents.job_board_scraper import scrape_all_boards
 from tools.strategic_filter import StrategicFilter
 from tools.email_templates import EmailTemplates
 
+# ── Import enhanced tailor agent ──
+from agents.enhanced_tailor_agent import generate_application_package
+
 
 # ─────────────────────────────────────────────
 # PIPELINE: Process a single job
@@ -397,25 +400,46 @@ def run_excel_hr_mode(dry_run: bool = False, daily_limit: int = None,
         logger.info(f"[{i}/{len(batch)}] {status_tag} {hr_name or 'HR'} @ {company}")
 
         try:
-            # STEP 1: Generate skill-specific pitch email
-            pitch_email = generate_pitch_email(
-                contact,
-                api_key=config.CLAUDE_API_KEY,
-                skill_area=skill_area
+            # STEP 1: Generate application package (story-mode resume + cover letter)
+            app_package = generate_application_package(
+                company=company,
+                skill_area=skill_area,
+                job_description=None,  # Could be added later if JD available
+                hr_name=hr_name,
+                api_key=config.CLAUDE_API_KEY
             )
 
-            # STEP 2: Generate PDF (base resume, no tailoring for cold outreach)
+            tailored_resume_md = app_package["resume_markdown"]
+            cover_letter = app_package["cover_letter"]
+
+            # STEP 2: Generate tailored resume PDF (story-mode, ATS-friendly)
             pdf_path = markdown_to_pdf(
-                resume_markdown=base_resume_md,
-                job_title="General Application",
+                resume_markdown=tailored_resume_md,
+                job_title="Application",
                 company=company,
                 output_dir=config.OUTPUT_DIR
             )
 
-            # STEP 3: Send (or dry-run preview)
+            # STEP 3: Compose email with cover letter + subject line for mailer
+            email_body = f"""Subject: {app_package["email_subject"]}
+
+{cover_letter}
+
+---
+
+Tailored resume attached.
+
+Best regards,
+Prajjwal Pandey
++91-8278674540
+LinkedIn: linkedin.com/in/prajjwal-pandey
+GitHub: github.com/prajjwalpandey
+"""
+
+            # STEP 4: Send (or dry-run preview)
             result = send_cold_email(
                 hr_email=hr_email,
-                cold_email_text=pitch_email,
+                cold_email_text=email_body,
                 pdf_path=pdf_path,
                 sender_email=config.GMAIL_ADDRESS,
                 app_password=config.GMAIL_APP_PASSWORD,
